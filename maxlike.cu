@@ -38,6 +38,97 @@ int main() {
     const int rows = 34935;
     const int n_rx = 4;
     const int n_tx = 8;
+    size_t H_size = (size_t)rows * n_rx * n_tx;
+    size_t X_size = (size_t)rows * n_tx;
+    size_t Y_size = (size_t)rows * n_rx;
+
+    float *h_H = load_bin("H.bin", H_size);
+    float *h_X = load_bin("X.bin", X_size);
+    float *h_Y = load_bin("Y.bin", Y_size); // used for reference, not detection
+
+    float *d_H, *d_X;
+    float2 *d_Y, *d_X_hat_ML, *d_X_hat_MMSE;
+    curandState *d_state;
+    int *d_bit_errors;
+
+    CHECK(cudaMalloc(&d_H, H_size * sizeof(float)));
+    CHECK(cudaMalloc(&d_X, X_size * sizeof(float)));
+    CHECK(cudaMalloc(&d_Y, Y_size * sizeof(float2)));
+    CHECK(cudaMalloc(&d_X_hat_ML, X_size * sizeof(float2)));
+    CHECK(cudaMalloc(&d_X_hat_MMSE, X_size * sizeof(float2)));
+    CHECK(cudaMalloc(&d_state, Y_size * sizeof(curandState)));
+    CHECK(cudaMalloc(&d_bit_errors, sizeof(int)));
+
+    CHECK(cudaMemcpy(d_H, h_H, H_size * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_X, h_X, X_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    const float snr_db_values[] = {0, 5, 10, 15, 20, 25, 30};
+    const int num_snr = sizeof(snr_db_values) / sizeof(float);
+    const int threads = 256;
+    const int blocksY = (Y_size + threads - 1) / threads;
+    const int blocksX = (X_size + threads - 1) / threads;
+
+    init_curand<<<blocksY, threads>>>(d_state, time(NULL), Y_size);
+    cudaDeviceSynchronize();
+
+    printf("SNR(dB), ML_BER, MMSE_BER, Throughput(Mb/s)\n");
+
+    for (int s = 0; s < num_snr; s++) {
+        float snr_db = snr_db_values[s];
+        float snr_lin = powf(10.0f, snr_db / 10.0f);
+        float noise_std = 1.0f / sqrtf(2.0f * snr_lin);
+
+        // Generate clean Y = H * X
+        mimo_forward_kernel<<<blocksY, threads>>>(d_H, d_X, d_Y, rows, n_rx, n_tx);
+        cudaDeviceSynchronize();
+
+        // Add noise
+        add_noise_kernel<<<blocksY, threads>>>(d_Y, noise_std, d_state, Y_size);
+        cudaDeviceSynchronize();
+
+        // Detection
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start);
+
+        mimo_detect_kernel<<<blocksX, threads>>>(d_H, d_Y, d_X_hat_ML, d_X_hat_MMSE, rows, n_rx, n_tx);
+        cudaDeviceSynchronize();
+
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, start, stop);
+
+        // Compute BERs
+        int h_bit_errors = 0;
+        CHECK(cudaMemset(d_bit_errors, 0, sizeof(int)));
+        compute_ber_kernel<<<blocksX, threads>>>(d_X, d_X_hat_ML, d_bit_errors, X_size);
+        CHECK(cudaMemcpy(&h_bit_errors, d_bit_errors, sizeof(int), cudaMemcpyDeviceToHost));
+        float ber_ml = (float)h_bit_errors / (X_size * 2);
+
+        CHECK(cudaMemset(d_bit_errors, 0, sizeof(int)));
+        compute_ber_kernel<<<blocksX, threads>>>(d_X, d_X_hat_MMSE, d_bit_errors, X_size);
+        CHECK(cudaMemcpy(&h_bit_errors, d_bit_errors, sizeof(int), cudaMemcpyDeviceToHost));
+        float ber_mmse = (float)h_bit_errors / (X_size * 2);
+
+        float throughput = (X_size * 2 / 1e6f) / (ms / 1000.0f);
+        printf("%5.1f dB, %8.6f, %8.6f, %8.3f\n", snr_db, ber_ml, ber_mmse, throughput);
+
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
+
+    free(h_H); free(h_X); free(h_Y);
+    cudaFree(d_H); cudaFree(d_X); cudaFree(d_Y);
+    cudaFree(d_X_hat_ML); cudaFree(d_X_hat_MMSE);
+    cudaFree(d_state); cudaFree(d_bit_errors);
+    return 0;
+}
+int main() {
+    const int rows = 34935;
+    const int n_rx = 4;
+    const int n_tx = 8;
     size_t x_row = (size_t)rows * n_tx;
     size_t y_row = (size_t)rows * n_rx;
     size_t num_elements = (size_t)rows * n_rx * n_tx;

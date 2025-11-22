@@ -2,3 +2,7 @@
 *.lib
 *.exp
 *.exe
+*.dll
+venv/
+__pycache__/
+*.pyc
